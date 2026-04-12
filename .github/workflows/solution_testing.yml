@@ -1,144 +1,24 @@
-name: Solution Testing
+name: Deprecated – See pr-checks.yml
+
+# ─────────────────────────────────────────────────────────────
+#  This workflow has been superseded by the three-workflow
+#  architecture introduced for DevSphere v2:
+#
+#    fork-ci.yml    — feedback on fork pushes (participant's minutes)
+#    pr-checks.yml  — authoritative test run on PR open/update
+#    pr-grader.yml  — privileged grading (secrets, leaderboard, labels)
+#
+#  This file is kept to avoid breaking any external references
+#  but does NOT run automatically.  It can be deleted safely
+#  once all repos have been migrated.
+# ─────────────────────────────────────────────────────────────
 on:
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
+
 jobs:
-  test-solution:
+  notice:
     runs-on: ubuntu-latest
-    outputs:
-      passed: ${{ steps.test.outputs.passed }}
-    
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 0
-
-      - name: Ensure sample files from repository main branch
-        run: |
-          cd ${{ github.workspace }}
-          mkdir -p samples
-          git fetch origin main --depth=1
-          git show origin/main:samples/in_sample.txt > samples/in_sample.txt
-          git show origin/main:samples/out_sample.txt > samples/out_sample.txt
-
-      - name: Run solution with sample input
-        id: test
-        run: |
-          cd ${{ github.workspace }}
-          if g++ -o solution1 solution1.cpp; then
-            echo "Compilation successful"
-            if timeout 40s ./solution1 < samples/in_sample.txt > actual_output.txt; then
-              if diff -u samples/out_sample.txt actual_output.txt > /dev/null; then
-                echo "Output matches expected result"
-                echo "passed=true" >> $GITHUB_OUTPUT
-              else
-                echo "Output does not match"
-                echo "passed=false" >> $GITHUB_OUTPUT
-              fi
-            else
-              EXIT_CODE=$?
-              if [ "$EXIT_CODE" -eq 124 ]; then
-                echo "Execution timed out after 40 seconds"
-              else
-                echo "Execution failed with exit code $EXIT_CODE"
-              fi
-              echo "passed=false" >> $GITHUB_OUTPUT
-            fi
-          else
-            echo "Compilation failed"
-            echo "passed=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Output solution result
-        run: |
-          echo "Solution passed: ${{ steps.test.outputs.passed }}"
-
-  check-commit:
-    runs-on: ubuntu-latest
-    needs: test-solution
-    outputs:
-      passed: ${{ steps.match.outputs.passed }}
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 2
-
-      - name: Validate PR has exactly one commit
-        id: prmeta
-        run: |
-          if [ "${{ github.event.pull_request.commits }}" = "1" ]; then
-            echo "single_commit=true" >> $GITHUB_OUTPUT
-            echo "PR has exactly one commit"
-          else
-            echo "single_commit=false" >> $GITHUB_OUTPUT
-            echo "PR must have exactly one commit, found: ${{ github.event.pull_request.commits }}"
-          fi
-
-      - name: Get parent of PR head commit
-        id: commit
-        run: |
-          HEAD_COMMIT=$(git rev-parse HEAD)
-          echo "head_commit=$HEAD_COMMIT" >> $GITHUB_OUTPUT
-          echo "PR head commit: $HEAD_COMMIT"
-
-          if git rev-parse --verify HEAD^ >/dev/null 2>&1; then
-            PARENT_COMMIT=$(git rev-parse HEAD^)
-            echo "parent_commit=$PARENT_COMMIT" >> $GITHUB_OUTPUT
-            echo "Parent commit of PR head: $PARENT_COMMIT"
-          else
-            echo "No parent commit found"
-            echo "parent_commit=" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Compare with target commit
-        id: match
-        env:
-          TARGET_COMMIT: ${{ secrets.TARGET_COMMIT_HASH }}
-          HEAD_COMMIT: ${{ steps.commit.outputs.head_commit }}
-          PARENT_COMMIT: ${{ steps.commit.outputs.parent_commit }}
-          SINGLE_COMMIT: ${{ steps.prmeta.outputs.single_commit }}
-        run: |
-          if [ "$SINGLE_COMMIT" = "true" ] && [ -n "$TARGET_COMMIT" ] && { [ "$HEAD_COMMIT" = "$TARGET_COMMIT" ] || [ "$PARENT_COMMIT" = "$TARGET_COMMIT" ]; }; then
-            echo "Commit hash matches target!"
-            echo "passed=true" >> $GITHUB_OUTPUT
-          else
-            echo "Commit hash does not match target"
-            echo "passed=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Output commit result
-        run: |
-          echo "Commit matched: ${{ steps.match.outputs.passed }}"
-
-  final-score:
-    runs-on: ubuntu-latest
-    needs: [test-solution, check-commit]
-
-    steps:
-      - name: Calculate final score
-        id: final
-        env:
-          SOLUTION_PASSED: ${{ needs.test-solution.outputs.passed }}
-          COMMIT_PASSED: ${{ needs.check-commit.outputs.passed }}
-        run: |
-          if [ "$SOLUTION_PASSED" = "true" ] && [ "$COMMIT_PASSED" = "true" ]; then
-            SCORE="100/100"
-          elif [ "$SOLUTION_PASSED" = "true" ] || [ "$COMMIT_PASSED" = "true" ]; then
-            SCORE="50/100"
-          else
-            SCORE="0/100"
-          fi
-
-          echo "score=$SCORE" >> $GITHUB_OUTPUT
-          echo "Final Score: $SCORE"
-
-      - name: Fail if score is not 100
-        if: steps.final.outputs.score != '100/100'
-        run: |
-          echo "Failing workflow because final score is ${{ steps.final.outputs.score }}"
-          exit 1
+      - run: |
+          echo "This workflow is deprecated."
+          echo "See fork-ci.yml / pr-checks.yml / pr-grader.yml."

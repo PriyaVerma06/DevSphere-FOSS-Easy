@@ -1,0 +1,369 @@
+name: PR Grader
+
+# ─────────────────────────────────────────────────────────────
+#  Runs AFTER "PR Checks" completes (workflow_run trigger).
+#
+#  Why workflow_run?
+#  pull_request events from forks have NO access to repository
+#  secrets and a read-only GITHUB_TOKEN.  workflow_run runs in
+#  the BASE REPO context with full secrets and write access —
+#  the only safe place to call the leaderboard API, check the
+#  TARGET_COMMIT_HASH secret, and add labels / comments.
+#
+#  Responsibilities:
+#    1. Handle failed PR Checks (label + comment)
+#    2. Block duplicate submissions
+#    3. Verify commit hash (FOSS repos, uses TARGET_COMMIT_HASH)
+#    4. Call the DevSphere leaderboard webhook
+#    5. Mark the PR Completed + post a success comment
+# ─────────────────────────────────────────────────────────────
+on:
+  workflow_run:
+    workflows: ["PR Checks"]
+    types: [completed]
+
+permissions:
+  pull-requests: write
+  issues: write
+  contents: read
+  actions: read      # needed to download artifacts from pr-checks
+
+jobs:
+  grade:
+    name: Grade Submission
+    runs-on: ubuntu-latest
+    # Only process PR-triggered runs (not direct pushes)
+    if: github.event.workflow_run.event == 'pull_request'
+
+    steps:
+      # ── Resolve PR number & author ─────────────────────────
+      - name: Read PR metadata
+        id: meta
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Primary source: workflow_run.pull_requests array
+            // NOTE: store in a local variable — core.getOutput() reads INPUT_*
+            // env vars (not previously set outputs) so it would return ''.
+            let prNum;
+            const prs = context.payload.workflow_run.pull_requests;
+            if (prs && prs.length > 0) {
+              prNum = prs[0].number;
+              core.setOutput('pr_number', String(prNum));
+              core.setOutput('head_sha',  context.payload.workflow_run.head_sha);
+            } else {
+              // Fallback: download artifact saved by pr-checks.yml
+              const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                run_id: context.payload.workflow_run.id,
+              });
+              const meta = artifacts.data.artifacts.find(a => a.name === 'pr-meta');
+              if (!meta) { core.setFailed('Cannot determine PR number'); return; }
+
+              const dl = await github.rest.actions.downloadArtifact({
+                owner:       context.repo.owner,
+                repo:        context.repo.repo,
+                artifact_id: meta.id,
+                archive_format: 'zip',
+              });
+              const fs   = require('fs');
+              const path = require('path');
+              const { execFileSync } = require('child_process');
+              const zip    = path.join(process.env.RUNNER_TEMP, 'pr-meta.zip');
+              const outDir = path.join(process.env.RUNNER_TEMP, 'pr-meta');
+              fs.writeFileSync(zip, Buffer.from(dl.data));
+              fs.mkdirSync(outDir, { recursive: true });
+              execFileSync('unzip', ['-o', zip, '-d', outDir]);
+              prNum = parseInt(fs.readFileSync(
+                path.join(outDir, 'pr-number.txt'), 'utf8').trim());
+              core.setOutput('pr_number', String(prNum));
+              core.setOutput('head_sha', context.payload.workflow_run.head_sha);
+            }
+
+            // Fetch full PR to get the author login
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              pull_number: prNum,
+            });
+            core.setOutput('author',       pr.user.login);
+            core.setOutput('commit_count', String(pr.commits));
+
+      # ── Helper: remove a label without failing if absent ───
+      # (reused across steps via inline script)
+
+      # ── CASE A: PR Checks failed ────────────────────────────
+      - name: Handle failed checks
+        if: github.event.workflow_run.conclusion != 'success'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = parseInt('${{ steps.meta.outputs.pr_number }}');
+
+            // Don't overwrite a Completed label from a previous passing run
+            const { data: labels } = await github.rest.issues.listLabelsOnIssue({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: prNumber,
+            });
+            if (labels.some(l => l.name === 'Completed')) return;
+
+            try {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: prNumber, name: 'Failed',
+              });
+            } catch (_) {}
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: prNumber, labels: ['Failed'],
+            });
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: prNumber,
+              body: [
+                '## ❌ Submission Failed',
+                '',
+                'One or more checks in **PR Checks** did not pass.',
+                `See the [workflow run](${{ github.event.workflow_run.html_url }}) for details.`,
+                '',
+                '**Fix the issues and push again to re-trigger grading.**',
+                '',
+                '— DevSphere Bot',
+              ].join('\n'),
+            });
+            core.setFailed('PR Checks did not pass');
+
+      # ── CASE B: Duplicate submission ────────────────────────
+      - name: Check for duplicate submission
+        if: github.event.workflow_run.conclusion == 'success'
+        id: dup
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const author    = '${{ steps.meta.outputs.author }}';
+            const prNumber  = parseInt('${{ steps.meta.outputs.pr_number }}');
+
+            // Paginate through all PRs to find prior Completed ones by this user
+            let page = 1, duplicate = null;
+            while (!duplicate) {
+              const { data } = await github.rest.pulls.list({
+                owner: context.repo.owner, repo: context.repo.repo,
+                state: 'all', per_page: 100, page,
+              });
+              if (data.length === 0) break;
+              duplicate = data.find(pr =>
+                pr.user.login === author &&
+                pr.number     !== prNumber &&
+                pr.labels.some(l => l.name === 'Completed')
+              );
+              page++;
+            }
+
+            core.setOutput('is_duplicate',   duplicate ? 'true' : 'false');
+            core.setOutput('duplicate_pr',   duplicate ? String(duplicate.number) : '');
+
+      - name: Close duplicate PR
+        if: |
+          github.event.workflow_run.conclusion == 'success' &&
+          steps.dup.outputs.is_duplicate == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = parseInt('${{ steps.meta.outputs.pr_number }}');
+            const dupPR    = '${{ steps.dup.outputs.duplicate_pr }}';
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: prNumber,
+              body: [
+                '## ❌ Duplicate Submission',
+                '',
+                `You already submitted this task successfully (see #${dupPR}).`,
+                'Re-submissions are not allowed.',
+                '',
+                '— DevSphere Bot',
+              ].join('\n'),
+            });
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: prNumber, labels: ['Duplicate'],
+            });
+            await github.rest.pulls.update({
+              owner: context.repo.owner, repo: context.repo.repo,
+              pull_number: prNumber, state: 'closed',
+            });
+
+      # ── Checkout for commit-hash check ─────────────────────
+      - name: Checkout PR head
+        if: |
+          github.event.workflow_run.conclusion == 'success' &&
+          steps.dup.outputs.is_duplicate == 'false'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      # ── CASE C: Commit hash verification (FOSS only) ────────
+      #  Skipped automatically when TARGET_COMMIT_HASH is not set
+      #  (WEB / APP repos).
+      - name: Verify commit hash
+        if: |
+          github.event.workflow_run.conclusion == 'success' &&
+          steps.dup.outputs.is_duplicate == 'false'
+        id: commit_check
+        env:
+          TARGET_COMMIT: ${{ secrets.TARGET_COMMIT_HASH }}
+        run: |
+          if [[ -z "$TARGET_COMMIT" ]]; then
+            echo "TARGET_COMMIT_HASH not configured — skipping (non-FOSS repo)."
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git fetch origin main --depth=1
+
+          HEAD="${{ github.event.workflow_run.head_sha }}"
+          COMMIT_COUNT=$(git rev-list --count origin/main.."$HEAD" 2>/dev/null || echo "0")
+          PARENT=$(git rev-parse "${HEAD}^" 2>/dev/null || echo "")
+
+          if [[ "$COMMIT_COUNT" == "1" ]] && \
+             { [[ "$HEAD" == "$TARGET_COMMIT" ]] || [[ "$PARENT" == "$TARGET_COMMIT" ]]; }; then
+            echo "Commit hash verified."
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Commit hash mismatch (commits ahead of main: $COMMIT_COUNT)."
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Handle failed commit check
+        if: |
+          github.event.workflow_run.conclusion == 'success' &&
+          steps.dup.outputs.is_duplicate == 'false' &&
+          steps.commit_check.outputs.passed == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = parseInt('${{ steps.meta.outputs.pr_number }}');
+
+            try {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: prNumber, name: 'Failed',
+              });
+            } catch (_) {}
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: prNumber, labels: ['Failed'],
+            });
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: prNumber,
+              body: [
+                '## ❌ Commit Verification Failed',
+                '',
+                '❌ **Commit hash mismatch** — your PR must contain exactly the correct commit.',
+                '',
+                '> **Hint:** Version control is a time machine!',
+                '> The right solution already exists somewhere in this repository\'s history.',
+                '',
+                '— DevSphere Bot',
+              ].join('\n'),
+            });
+            core.setFailed('Commit check failed');
+
+      # ── CASE D: All checks passed — call leaderboard ────────
+      - name: Call DevSphere leaderboard API
+        if: |
+          github.event.workflow_run.conclusion == 'success' &&
+          steps.dup.outputs.is_duplicate == 'false' &&
+          steps.commit_check.outputs.passed == 'true'
+        id: leaderboard
+        env:
+          WEBHOOK_SECRET: ${{ secrets.GITHUB_WEBHOOK_SECRET }}
+          LEADERBOARD_URL: ${{ secrets.LEADERBOARD_WEBHOOK_URL }}
+        run: |
+          HEAD_SHA="${{ github.event.workflow_run.head_sha }}"
+
+          # ISO-8601 timestamp of the head commit (used for leaderboard ranking)
+          COMMIT_TIME=$(git log -1 --format="%cI" "$HEAD_SHA" 2>/dev/null \
+                        || date -u +"%Y-%m-%dT%H:%M:%S+00:00")
+
+          # Build compact JSON — key order must match Node's JSON.stringify
+          # so the HMAC re-computed by the server matches ours.
+          PAYLOAD=$(jq -cn \
+            --arg login  "${{ steps.meta.outputs.author }}" \
+            --arg repo   "${{ github.repository }}" \
+            --arg time   "$COMMIT_TIME" \
+            '{
+              sender:     { login: $login },
+              repository: { full_name: $repo },
+              task_title: "foss",
+              difficulty: "easy",
+              commit_time: $time
+            }')
+
+          # HMAC-SHA256 signature (matches the server's verification logic)
+          SIGNATURE=$(printf '%s' "$PAYLOAD" \
+            | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" \
+            | awk '{print "sha256=" $NF}')
+
+          HTTP_CODE=$(curl -s -o /tmp/lb_resp.txt -w "%{http_code}" \
+            -X POST "$LEADERBOARD_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Hub-Signature-256: $SIGNATURE" \
+            -d "$PAYLOAD")
+
+          echo "Leaderboard → HTTP $HTTP_CODE: $(cat /tmp/lb_resp.txt)"
+
+          # Surface warnings but don't fail the grader — PR already passed all checks.
+          if [[ "$HTTP_CODE" != "200" ]]; then
+            echo "::warning::Leaderboard API returned $HTTP_CODE"
+          fi
+
+      # ── Mark PR as Completed ────────────────────────────────
+      - name: Mark Completed
+        if: |
+          github.event.workflow_run.conclusion == 'success' &&
+          steps.dup.outputs.is_duplicate == 'false' &&
+          steps.commit_check.outputs.passed == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = parseInt('${{ steps.meta.outputs.pr_number }}');
+
+            // Remove Failed label from any earlier failed attempt
+            try {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: prNumber, name: 'Failed',
+              });
+            } catch (_) {}
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: prNumber, labels: ['Completed'],
+            });
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: prNumber,
+              body: [
+                '## ✅ Submission Accepted!',
+                '',
+                'All checks passed and your score has been recorded on the',
+                '[DevSphere Leaderboard](https://dev-sphere-leader-board.vercel.app/).',
+                '',
+                '| Check | Status |',
+                '|-------|--------|',
+                '| Tests | ✅ Passed |',
+                '| Read-only files | ✅ Clean |',
+                '| Commit verification | ✅ Verified |',
+                '',
+                '— DevSphere Bot',
+              ].join('\n'),
+            });
