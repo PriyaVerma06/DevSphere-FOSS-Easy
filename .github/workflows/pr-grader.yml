@@ -284,8 +284,8 @@ jobs:
           steps.commit_check.outputs.passed == 'true'
         id: leaderboard
         env:
-          WEBHOOK_SECRET: ${{ secrets.GITHUB_WEBHOOK_SECRET }}
-          LEADERBOARD_URL: ${{ secrets.LEADERBOARD_WEBHOOK_URL }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          LEADERBOARD_URL: ${{ secrets.LEADERBOARD_URL }}
         run: |
           HEAD_SHA="${{ github.event.workflow_run.head_sha }}"
 
