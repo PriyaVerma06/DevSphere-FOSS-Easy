@@ -11,7 +11,7 @@ int main() {
             current++;
             if (current % n != 0) count++;
         }
-        cout << current << endl;
+        cout << current+1 << endl;
     }
     return 0;
 }
